@@ -21,12 +21,13 @@ use tokio::{
 
 use cita_cloud_proto::{
     blockchain::{
-        raw_transaction::Tx, Block, BlockHeader, CompactBlock, RawTransaction, RawTransactions,
+        raw_transaction::Tx, Block, BlockHeader, CompactBlock, CompactBlockBody, RawTransaction,
+        RawTransactions,
     },
-    client::{CryptoClientTrait, NetworkClientTrait},
+    client::NetworkClientTrait,
     common::{
-        proposal_enum::Proposal, Address, ConsensusConfiguration, Empty, Hash, Hashes, NodeNetInfo,
-        NodeStatus, PeerStatus, Proof, ProposalEnum, StateRoot,
+        Address, ConsensusConfiguration, Empty, Hash, Hashes, NodeNetInfo, NodeStatus, PeerStatus,
+        Proof, ProposalInner, StateRoot,
     },
     controller::BlockNumber,
     network::NetworkMsg,
@@ -35,8 +36,8 @@ use cita_cloud_proto::{
 };
 use cloud_util::{
     clean_0x,
+    common::extract_compact,
     common::{get_tx_hash, h160_address_check},
-    crypto::{get_block_hash, hash_data, sign_message},
     storage::load_data,
     unix_now,
 };
@@ -45,9 +46,9 @@ use crate::{
     auth::Authentication,
     config::ControllerConfig,
     controller_msg_type::ControllerMsgType,
+    crypto::{check_transactions, get_block_hash, hash_data},
     grpc_client::{
         consensus::{check_block, reconfigure},
-        crypto_client,
         executor::exec_block,
         network::{get_network_status, get_peers_info},
         network_client,
@@ -119,9 +120,12 @@ pub struct Chain {
     pub init_block_number: u64,
     // sync state flag
     is_sync: Arc<RwLock<bool>>,
+
+    pub private_key_path: String,
 }
 
 impl Chain {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: ControllerConfig,
         current_block_number: u64,
@@ -130,6 +134,7 @@ impl Chain {
         genesis: GenesisBlock,
         task_sender: mpsc::Sender<Event>,
         initial_sys_config: SystemConfig,
+        private_key_path: String,
     ) -> Self {
         let node_address = hex::decode(clean_0x(&config.node_address)).unwrap();
         info!("node address: {}", &config.node_address);
@@ -184,6 +189,7 @@ impl Chain {
             own_proposal: Arc::new(RwLock::new(None)),
             genesis,
             is_sync: Arc::new(RwLock::new(false)),
+            private_key_path,
         }
     }
 
@@ -293,16 +299,7 @@ impl Chain {
         raw_txs: RawTransactions,
         broadcast: bool,
     ) -> Result<Hashes, StatusCodeEnum> {
-        match crypto_client().check_transactions(raw_txs.clone()).await {
-            Ok(code) => StatusCodeEnum::from(code).is_success()?,
-            Err(e) => {
-                warn!(
-                    "batch transactions failed: check_transactions failed: {}",
-                    e.to_string()
-                );
-                return Err(StatusCodeEnum::CryptoServerNotReady);
-            }
-        }
+        check_transactions(&raw_txs).is_success()?;
 
         let mut hashes = Vec::new();
         {
@@ -503,18 +500,19 @@ impl Chain {
         proposal_height: u64,
         data: &[u8],
     ) -> Result<(), StatusCodeEnum> {
-        let proposal_enum = ProposalEnum::decode(data).map_err(|_| {
-            warn!("check proposal failed: decode ProposalEnum failed");
+        let proposal_inner = ProposalInner::decode(data).map_err(|_| {
+            warn!("check proposal failed: decode ProposalInner failed");
             StatusCodeEnum::DecodeError
         })?;
-        let Proposal::BftProposal(bft_proposal) =
-            proposal_enum.proposal.ok_or(StatusCodeEnum::NoneProposal)?;
-        let block = &bft_proposal.proposal.ok_or(StatusCodeEnum::NoneProposal)?;
+
+        let block = &proposal_inner
+            .proposal
+            .ok_or(StatusCodeEnum::NoneProposal)?;
         let header = block
             .header
             .as_ref()
             .ok_or(StatusCodeEnum::NoneBlockHeader)?;
-        let block_hash = get_block_hash(crypto_client(), block.header.as_ref()).await?;
+        let block_hash = get_block_hash(block.header.as_ref())?;
         let block_height = header.height;
 
         //check height is consistent
@@ -558,13 +556,13 @@ impl Chain {
                     pre_height_bytes.clone(),
                 )
                 .await?;
-                if bft_proposal.pre_state_root != pre_state_root {
+                if proposal_inner.pre_state_root != pre_state_root {
                     warn!(
-                            "check proposal({}) failed: pre_state_root: 0x{}, local pre_state_root: 0x{}",
-                            block_height,
-                            hex::encode(&bft_proposal.pre_state_root),
-                            hex::encode(&pre_state_root),
-                        );
+                        "check proposal({}) failed: pre_state_root: 0x{}, local pre_state_root: 0x{}",
+                        block_height,
+                        hex::encode(&proposal_inner.pre_state_root),
+                        hex::encode(&pre_state_root),
+                    );
                     return Err(StatusCodeEnum::ProposalCheckError);
                 }
 
@@ -613,22 +611,44 @@ impl Chain {
 
                 //check quota and transaction_root
                 let mut total_quota = 0;
-                let mut transantion_data = Vec::new();
-                let body = &block
+                let tx_hashes = &block
                     .body
                     .as_ref()
                     .ok_or(StatusCodeEnum::NoneBlockBody)?
-                    .body;
-                let tx_count = body.len();
-                for tx in body {
-                    total_quota += get_tx_quota(tx)?;
-                    if total_quota > sys_config.quota_limit {
-                        return Err(StatusCodeEnum::QuotaUsedExceed);
+                    .tx_hashes;
+                let tx_count = tx_hashes.len();
+                let mut transantion_data = Vec::new();
+                let mut miss_tx_hash_list = Vec::new();
+                for tx_hash in tx_hashes {
+                    if let Some(tx) = self.pool.read().await.pool_get_tx(tx_hash) {
+                        total_quota += get_tx_quota(&tx)?;
+                        if total_quota > sys_config.quota_limit {
+                            return Err(StatusCodeEnum::QuotaUsedExceed);
+                        }
+                        transantion_data.extend_from_slice(tx_hash);
+                    } else {
+                        miss_tx_hash_list.push(tx_hash);
                     }
-
-                    transantion_data.extend_from_slice(get_tx_hash(tx)?);
                 }
-                let transactions_root = hash_data(crypto_client(), &transantion_data).await?;
+
+                if !miss_tx_hash_list.is_empty() {
+                    let addr = Address {
+                        address: proposer.to_vec(),
+                    };
+                    let origin = NodeAddress::from(&addr).0;
+                    for tx_hash in miss_tx_hash_list {
+                        self.unicast_sync_tx(
+                            origin,
+                            SyncTxRequest {
+                                tx_hash: tx_hash.to_vec(),
+                            },
+                        )
+                        .await;
+                    }
+                    return Err(StatusCodeEnum::NoneRawTx);
+                }
+
+                let transactions_root = hash_data(&transantion_data);
                 if transactions_root != header.transactions_root {
                     warn!(
                         "check proposal({}) failed: header transactions_root: {}, controller calculate: {}",
@@ -636,13 +656,6 @@ impl Chain {
                     );
                     return Err(StatusCodeEnum::ProposalCheckError);
                 }
-
-                //check transactions in block body
-                self.batch_transactions(
-                    block.body.to_owned().ok_or(StatusCodeEnum::NoneBlockBody)?,
-                    false,
-                )
-                .await?;
 
                 // add remote proposal
                 {
@@ -1069,6 +1082,7 @@ impl Chain {
         SyncBlockRespond,
         "sync_block_respond"
     );
+    impl_unicast!(unicast_sync_tx, SyncTxRequest, "sync_tx");
     impl_unicast!(unicast_sync_tx_respond, SyncTxRespond, "sync_tx_respond");
     impl_unicast!(
         unicast_chain_status_respond,
@@ -1152,7 +1166,7 @@ impl Chain {
             chain_id: config.chain_id,
             height,
             hash: Some(Hash {
-                hash: get_block_hash(crypto_client(), compact_block.header.as_ref()).await?,
+                hash: get_block_hash(compact_block.header.as_ref())?,
             }),
             address: Some(self.local_address.clone()),
         })
@@ -1282,8 +1296,14 @@ impl Chain {
             warn!("make csi failed: encode ChainStatus failed");
             StatusCodeEnum::EncodeError
         })?;
-        let msg_hash = hash_data(crypto_client(), &chain_status_bytes).await?;
-        let signature = sign_message(crypto_client(), &msg_hash).await?;
+        let msg_hash = hash_data(&chain_status_bytes);
+
+        #[cfg(feature = "sm")]
+        let crypto = crypto_sm::crypto::Crypto::new(&self.private_key_path);
+        #[cfg(feature = "eth")]
+        let crypto = crypto_eth::crypto::Crypto::new(&self.private_key_path);
+
+        let signature = crypto.sign_message(&msg_hash)?;
 
         Ok(ChainStatusInit {
             chain_status: Some(own_status),
@@ -1335,11 +1355,10 @@ impl Chain {
             // already have own proposal
             Ok(())
         } else {
-            let block_number = *self.block_number.read().await;
             let prevhash = self.block_hash.read().await.clone();
-            let height = block_number + 1;
+            let height = *self.block_number.read().await + 1;
 
-            let (tx_list, quota) = {
+            let (tx_hash_list, quota) = {
                 let mut pool = self.pool.write().await;
                 let ret = pool.package(height);
                 let (pool_len, pool_quota) = pool.pool_status();
@@ -1349,13 +1368,13 @@ impl Chain {
                 );
                 ret
             };
-            let tx_count = tx_list.len();
+            let tx_count = tx_hash_list.len();
 
             let mut transantion_data = Vec::new();
-            for raw_tx in tx_list.iter() {
-                transantion_data.extend_from_slice(get_tx_hash(raw_tx)?);
+            for tx_hash in tx_hash_list.iter() {
+                transantion_data.extend_from_slice(tx_hash);
             }
-            let transactions_root = hash_data(crypto_client(), &transantion_data).await?;
+            let transactions_root = hash_data(&transantion_data);
 
             let header = BlockHeader {
                 prevhash: prevhash.clone(),
@@ -1365,12 +1384,12 @@ impl Chain {
                 proposer,
             };
 
-            let full_block = Block {
+            let compact_block = CompactBlock {
                 version: 0,
                 header: Some(header.clone()),
-                body: Some(RawTransactions { body: tx_list }),
-                proof: vec![],
-                state_root: vec![],
+                body: Some(CompactBlockBody {
+                    tx_hashes: tx_hash_list,
+                }),
             };
 
             let mut block_header_bytes = Vec::new();
@@ -1378,10 +1397,10 @@ impl Chain {
                 .encode(&mut block_header_bytes)
                 .expect("add proposal failed: encode BlockHeader failed");
 
-            let block_hash = hash_data(crypto_client(), &block_header_bytes).await?;
+            let block_hash = hash_data(&block_header_bytes);
 
             let mut own_proposal = self.own_proposal.write().await;
-            *own_proposal = Some((height, assemble_proposal(full_block.clone(), height).await?));
+            *own_proposal = Some((height, assemble_proposal(&compact_block, height).await?));
             self.candidates.write().await.insert(block_hash.clone());
 
             info!(
@@ -1468,19 +1487,22 @@ impl Chain {
 
         // persistence to storage
         {
-            let block_with_stateroot_bytes = {
+            let block_bytes = {
                 let mut buf = Vec::with_capacity(block.encoded_len());
                 block.encode(&mut buf).map_err(|_| {
                     warn!("finalize block failed: encode Block failed");
                     StatusCodeEnum::EncodeError
                 })?;
-                buf
+                let mut block_bytes = Vec::new();
+                block_bytes.extend_from_slice(&block_hash);
+                block_bytes.extend_from_slice(&buf);
+                block_bytes
             };
 
             store_data(
                 i32::from(Regions::AllBlockData) as u32,
                 block_height.to_be_bytes().to_vec(),
-                block_with_stateroot_bytes,
+                block_bytes,
             )
             .await
             .is_success()?;
@@ -1574,42 +1596,54 @@ impl Chain {
             }
         }
 
-        let bft_proposal = match ProposalEnum::decode(proposal)
-            .map_err(|_| {
-                warn!(
-                    "commit block({}) failed: decode ProposalEnum failed",
-                    height
-                );
-                StatusCodeEnum::DecodeError
-            })?
-            .proposal
-        {
-            Some(Proposal::BftProposal(bft_proposal)) => Ok(bft_proposal),
-            None => {
-                warn!("commit block({}) failed: proposal is none", height);
-                Err(StatusCodeEnum::NoneProposal)
-            }
-        }?;
+        let proposal_inner = ProposalInner::decode(proposal).map_err(|_| {
+            warn!(
+                "commit block({}) failed: decode ProposalInner failed",
+                height
+            );
+            StatusCodeEnum::DecodeError
+        })?;
 
-        if let Some(mut full_block) = bft_proposal.proposal {
-            full_block.proof = proof.to_vec();
+        if let Some(compact_block) = proposal_inner.proposal {
+            let block_hash = get_block_hash(compact_block.header.as_ref())?;
 
-            let _block_hash = get_block_hash(crypto_client(), full_block.header.as_ref()).await?;
+            let prev_hash = compact_block.header.clone().unwrap().prevhash;
 
-            let prev_hash = full_block.header.clone().unwrap().prevhash;
+            let self_block_hash = self.block_hash.read().await.clone();
 
-            let block_hash = self.block_hash.read().await.clone();
-
-            if prev_hash != block_hash {
+            if prev_hash != self_block_hash {
                 warn!(
                     "commit block({}) failed: get prehash: 0x{}, correct prehash: 0x{}. hash: 0x{}",
                     height,
                     hex::encode(&prev_hash),
-                    hex::encode(&block_hash),
+                    hex::encode(&self_block_hash),
                     hex::encode(&block_hash),
                 );
                 return Err(StatusCodeEnum::ProposalCheckError);
             }
+
+            let mut tx_list = vec![];
+            let tx_hashes = &compact_block
+                .body
+                .as_ref()
+                .ok_or(StatusCodeEnum::NoneBlockBody)?
+                .tx_hashes;
+
+            for tx_hash in tx_hashes {
+                if let Some(tx) = self.pool.read().await.pool_get_tx(tx_hash) {
+                    tx_list.push(tx);
+                } else {
+                    return Err(StatusCodeEnum::NoneRawTx);
+                }
+            }
+
+            let full_block = Block {
+                version: 0,
+                header: compact_block.header.clone(),
+                body: Some(RawTransactions { body: tx_list }),
+                proof: proof.to_vec(),
+                state_root: vec![],
+            };
 
             info!(
                 "commit block({}): hash: 0x{}",
@@ -1646,15 +1680,15 @@ impl Chain {
     }
 
     pub async fn process_block(
-        &mut self,
+        &self,
         block: Block,
     ) -> Result<(ConsensusConfiguration, ChainStatus), StatusCodeEnum> {
-        let _block_hash = get_block_hash(crypto_client(), block.header.as_ref()).await?;
+        let block_hash = get_block_hash(block.header.as_ref())?;
         let header = block.header.clone().unwrap();
         let height = header.height;
 
         let block_number = *self.block_number.read().await + 1;
-        let block_hash = self.block_hash.read().await.clone();
+        let self_block_hash = self.block_hash.read().await.clone();
 
         if height != block_number {
             warn!(
@@ -1669,18 +1703,19 @@ impl Chain {
             }
         }
 
-        if header.prevhash != block_hash {
+        if header.prevhash != self_block_hash {
             warn!(
                 "process block({}) failed: get prehash: 0x{}, correct prehash: 0x{}. hash: 0x{}",
                 height,
                 hex::encode(&header.prevhash),
-                hex::encode(&block_hash),
+                hex::encode(&self_block_hash),
                 hex::encode(&block_hash)
             );
             return Err(StatusCodeEnum::BlockCheckError);
         }
 
-        let proposal_bytes_for_check = assemble_proposal(block.clone(), height).await?;
+        let compact_blk = extract_compact(block.clone());
+        let proposal_bytes_for_check = assemble_proposal(&compact_blk, height).await?;
 
         let status = check_block(height, proposal_bytes_for_check, block.proof.clone()).await;
         if status != StatusCodeEnum::Success {
@@ -1692,21 +1727,8 @@ impl Chain {
             auth.check_transactions(block.body.as_ref().ok_or(StatusCodeEnum::NoneBlockBody)?)?
         }
 
-        match crypto_client()
-            .check_transactions(block.body.clone().ok_or(StatusCodeEnum::NoneBlockBody)?)
-            .await
-        {
-            Ok(code) => StatusCodeEnum::from(code).is_success()?,
-            Err(e) => {
-                warn!(
-                    "process block({}) failed: check transactions failed: {}. hash: 0x{}",
-                    height,
-                    e.to_string(),
-                    hex::encode(&block_hash),
-                );
-                return Err(StatusCodeEnum::CryptoServerNotReady);
-            }
-        }
+        check_transactions(block.body.as_ref().ok_or(StatusCodeEnum::NoneBlockBody)?)
+            .is_success()?;
 
         self.finalize_block(block, block_hash.clone()).await?;
 

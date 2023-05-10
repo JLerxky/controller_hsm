@@ -18,7 +18,11 @@ impl Deref for ControllerStateMachine {
 #[derive(Debug)]
 pub enum Event {
     TimerElapsed,
-
+    // init event
+    NetworkServiceReady,
+    ExecutorServiceReady,
+    StorageServiceReady,
+    SystemConfigInitialized,
     // chain status respond
     SyncBlockReq(SyncBlockRequest, u64),
     // multicast sync block request
@@ -30,18 +34,52 @@ pub enum Event {
 }
 
 #[state_machine(
-    initial = "State::uninitialized(false)",
+    initial = "State::initializing(false, false, false, false)",
     state(derive(Debug, Clone)),
     superstate(derive(Debug, Clone)),
     on_transition = "Self::on_transition",
     on_dispatch = "Self::on_dispatch"
 )]
 impl ControllerStateMachine {
-    #[state]
-    async fn uninitialized(net_ready: &mut bool, event: &Event) -> Response<State> {
+    #[state(superstate = "waiting_for_initialization")]
+    fn initializing(
+        network: &mut bool,
+        executor: &mut bool,
+        storage: &mut bool,
+        sys_config: &mut bool,
+        event: &Event,
+    ) -> Response<State> {
         match event {
-            Event::TimerElapsed => Transition(State::uninitialized(*net_ready)),
+            Event::NetworkServiceReady => {
+                *network = true;
+                Super
+            }
+            Event::ExecutorServiceReady => {
+                *executor = true;
+                Super
+            }
+            Event::StorageServiceReady => {
+                *storage = true;
+                Super
+            }
+            Event::SystemConfigInitialized => {
+                *sys_config = true;
+                Super
+            }
             _ => Super,
+        }
+    }
+
+    #[superstate]
+    fn waiting_for_initialization(
+        network: &bool,
+        executor: &bool,
+        storage: &bool,
+        sys_config: &bool,
+    ) -> Response<State> {
+        match (network, executor, storage, sys_config) {
+            (true, true, true, true) => Transition(State::increasing()),
+            _ => Handled,
         }
     }
 
