@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
+use statig::awaitable::InitializedStateMachine;
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use cita_cloud_proto::{
@@ -31,11 +35,13 @@ use crate::{
 
 // grpc server of RPC
 pub struct RPCServer {
-    controller: ControllerStateMachine,
+    controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
 }
 
 impl RPCServer {
-    pub(crate) fn new(controller: ControllerStateMachine) -> Self {
+    pub(crate) fn new(
+        controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
+    ) -> Self {
         RPCServer { controller }
     }
 }
@@ -52,6 +58,8 @@ impl RpcService for RPCServer {
 
         let flag = request.into_inner().flag;
         self.controller
+            .read()
+            .await
             .rpc_get_block_number(flag)
             .await
             .map_or_else(
@@ -74,7 +82,9 @@ impl RpcService for RPCServer {
         let raw_tx = request.into_inner();
 
         self.controller
-            .rpc_send_raw_transaction(raw_tx, self.controller.config.enable_forward)
+            .read()
+            .await
+            .rpc_send_raw_transaction(raw_tx, self.controller.read().await.config.enable_forward)
             .await
             .map_or_else(
                 |e| Err(Status::invalid_argument(e.to_string())),
@@ -96,7 +106,9 @@ impl RpcService for RPCServer {
         let raw_txs = request.into_inner();
 
         self.controller
-            .batch_transactions(raw_txs, self.controller.config.enable_forward)
+            .read()
+            .await
+            .batch_transactions(raw_txs, self.controller.read().await.config.enable_forward)
             .await
             .map_or_else(
                 |e| Err(Status::invalid_argument(e.to_string())),
@@ -118,6 +130,8 @@ impl RpcService for RPCServer {
         let hash = request.into_inner();
 
         self.controller
+            .read()
+            .await
             .rpc_get_block_by_hash(hash.hash)
             .await
             .map_or_else(
@@ -140,6 +154,8 @@ impl RpcService for RPCServer {
         let hash = request.into_inner().hash;
 
         self.controller
+            .read()
+            .await
             .rpc_get_height_by_hash(hash)
             .await
             .map_or_else(
@@ -162,6 +178,8 @@ impl RpcService for RPCServer {
         let block_number = request.into_inner().block_number;
 
         self.controller
+            .read()
+            .await
             .rpc_get_block_by_number(block_number)
             .await
             .map_or_else(
@@ -184,6 +202,8 @@ impl RpcService for RPCServer {
         let height: u64 = request.into_inner().block_number;
 
         self.controller
+            .read()
+            .await
             .rpc_get_state_root_by_number(height)
             .await
             .map_or_else(
@@ -206,6 +226,8 @@ impl RpcService for RPCServer {
         let height: u64 = request.into_inner().block_number;
 
         self.controller
+            .read()
+            .await
             .rpc_get_proof_by_number(height)
             .await
             .map_or_else(
@@ -228,6 +250,8 @@ impl RpcService for RPCServer {
         let block_number = request.into_inner().block_number;
 
         self.controller
+            .read()
+            .await
             .rpc_get_block_detail_by_number(block_number)
             .await
             .map_or_else(
@@ -250,6 +274,8 @@ impl RpcService for RPCServer {
         let hash = request.into_inner();
 
         self.controller
+            .read()
+            .await
             .rpc_get_transaction(hash.hash)
             .await
             .map_or_else(
@@ -269,13 +295,18 @@ impl RpcService for RPCServer {
         cloud_util::tracer::set_parent(&request);
         debug!("get_system_config request: {:?}", request);
 
-        self.controller.rpc_get_system_config().await.map_or_else(
-            |e| Err(Status::invalid_argument(e.to_string())),
-            |sys_config| {
-                let reply = Response::new(sys_config.generate_proto_sys_config());
-                Ok(reply)
-            },
-        )
+        self.controller
+            .read()
+            .await
+            .rpc_get_system_config()
+            .await
+            .map_or_else(
+                |e| Err(Status::invalid_argument(e.to_string())),
+                |sys_config| {
+                    let reply = Response::new(sys_config.generate_proto_sys_config());
+                    Ok(reply)
+                },
+            )
     }
 
     #[instrument(skip_all)]
@@ -288,9 +319,11 @@ impl RpcService for RPCServer {
 
         let height: u64 = request.into_inner().block_number;
 
-        let mut initial_sys_config = self.controller.initial_sys_config.clone();
+        let mut initial_sys_config = self.controller.read().await.initial_sys_config.clone();
         let utxo_tx_hashes = self
             .controller
+            .read()
+            .await
             .rpc_get_system_config()
             .await
             .unwrap()
@@ -330,6 +363,8 @@ impl RpcService for RPCServer {
         let block_number = request.into_inner().block_number;
 
         self.controller
+            .read()
+            .await
             .rpc_get_block_hash(block_number)
             .await
             .map_or_else(
@@ -352,6 +387,8 @@ impl RpcService for RPCServer {
         let tx_hash = request.into_inner().hash;
 
         self.controller
+            .read()
+            .await
             .rpc_get_tx_block_number(tx_hash)
             .await
             .map_or_else(
@@ -374,6 +411,8 @@ impl RpcService for RPCServer {
         let tx_hash = request.into_inner();
 
         self.controller
+            .read()
+            .await
             .rpc_get_tx_index(tx_hash.hash)
             .await
             .map_or_else(
@@ -395,7 +434,7 @@ impl RpcService for RPCServer {
 
         let info = request.into_inner();
 
-        let reply = Response::new(self.controller.rpc_add_node(info).await);
+        let reply = Response::new(self.controller.read().await.rpc_add_node(info).await);
 
         Ok(reply)
     }
@@ -410,6 +449,8 @@ impl RpcService for RPCServer {
 
         Ok(Response::new(
             self.controller
+                .read()
+                .await
                 .rpc_get_node_status(request.into_inner())
                 .await
                 .map_err(|e| Status::invalid_argument(e.to_string()))?,

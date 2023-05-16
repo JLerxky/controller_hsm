@@ -72,14 +72,6 @@ use crate::{
     GenesisBlock, {impl_broadcast, impl_multicast, impl_unicast},
 };
 
-#[allow(dead_code)]
-#[derive(Eq, PartialEq)]
-pub enum ChainStep {
-    SyncStep,
-    OnlineStep,
-    BusyState,
-}
-
 #[allow(dead_code, clippy::type_complexity)]
 #[derive(Clone)]
 pub struct Chain {
@@ -124,6 +116,7 @@ pub struct Chain {
     pub private_key_path: String,
 }
 
+// rpc
 impl Chain {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -721,7 +714,10 @@ impl Chain {
             Err(e) => Err(e),
         }
     }
+}
 
+// network
+impl Chain {
     pub async fn process_network_msg(&self, msg: NetworkMsg) -> Result<(), StatusCodeEnum> {
         debug!("get network msg: {}", msg.r#type);
         match ControllerMsgType::from(msg.r#type.as_str()) {
@@ -1089,7 +1085,10 @@ impl Chain {
         ChainStatusRespond,
         "chain_status_respond"
     );
+}
 
+// status
+impl Chain {
     pub async fn get_global_status(&self) -> (NodeAddress, ChainStatus) {
         let rd = self.global_status.read().await;
         rd.clone()
@@ -1215,35 +1214,28 @@ impl Chain {
             for _ in 0..controller_clone.config.sync_req {
                 let (global_address, global_status) = controller_clone.get_global_status().await;
 
-                match controller_clone.next_step(&global_status).await {
-                    ChainStep::SyncStep => {
-                        if let Some(sync_req) = controller_clone
-                            .sync_manager
-                            .get_sync_block_req(current_height, &global_status)
+                if controller_clone.need_sync(&global_status).await {
+                    if let Some(sync_req) = controller_clone
+                        .sync_manager
+                        .get_sync_block_req(current_height, &global_status)
+                        .await
+                    {
+                        controller_clone.set_sync_state(true).await;
+                        current_height = sync_req.end_height;
+                        controller_clone
+                            .unicast_sync_block(global_address.0, sync_req.clone())
                             .await
-                        {
-                            if !controller_clone.get_sync_state().await {
-                                controller_clone.set_sync_state(true).await;
-                            }
-                            current_height = sync_req.end_height;
-                            controller_clone
-                                .unicast_sync_block(global_address.0, sync_req.clone())
-                                .await
-                                .await
-                                .unwrap();
-                            if sync_req.start_height == sync_req.end_height {
-                                return;
-                            }
-                        } else {
+                            .await
+                            .unwrap();
+                        if sync_req.start_height == sync_req.end_height {
                             return;
                         }
-                    }
-                    ChainStep::OnlineStep => {
-                        controller_clone.set_sync_state(false).await;
-                        controller_clone.sync_manager.clear().await;
+                    } else {
                         return;
                     }
-                    ChainStep::BusyState => return,
+                } else {
+                    controller_clone.set_sync_state(false).await;
+                    return;
                 }
             }
         });
@@ -1254,34 +1246,27 @@ impl Chain {
         for _ in 0..self.config.sync_req {
             let (global_address, global_status) = self.get_global_status().await;
 
-            match self.next_step(&global_status).await {
-                ChainStep::SyncStep => {
-                    if let Some(sync_req) = self
-                        .sync_manager
-                        .get_sync_block_req(current_height, &global_status)
+            if self.need_sync(&global_status).await {
+                if let Some(sync_req) = self
+                    .sync_manager
+                    .get_sync_block_req(current_height, &global_status)
+                    .await
+                {
+                    self.set_sync_state(true).await;
+                    current_height = sync_req.end_height;
+                    self.unicast_sync_block(global_address.0, sync_req.clone())
                         .await
-                    {
-                        if !self.get_sync_state().await {
-                            self.set_sync_state(true).await;
-                        }
-                        current_height = sync_req.end_height;
-                        self.unicast_sync_block(global_address.0, sync_req.clone())
-                            .await
-                            .await
-                            .unwrap();
-                        if sync_req.start_height == sync_req.end_height {
-                            break;
-                        }
-                    } else {
+                        .await
+                        .unwrap();
+                    if sync_req.start_height == sync_req.end_height {
                         break;
                     }
-                }
-                ChainStep::OnlineStep => {
-                    self.set_sync_state(false).await;
-                    self.sync_manager.clear().await;
+                } else {
                     break;
                 }
-                ChainStep::BusyState => unreachable!(),
+            } else {
+                self.set_sync_state(false).await;
+                break;
             }
         }
         Ok(())
@@ -1316,8 +1301,12 @@ impl Chain {
     }
 
     pub async fn set_sync_state(&self, state: bool) {
-        let mut wr = self.is_sync.write().await;
-        *wr = state;
+        if self.get_sync_state().await != state {
+            *self.is_sync.write().await = state;
+        }
+        if !state {
+            self.sync_manager.clear().await;
+        }
     }
 
     pub async fn get_proposal(&self) -> Result<(u64, Vec<u8>), StatusCodeEnum> {
@@ -1349,7 +1338,7 @@ impl Chain {
         global_status: &ChainStatus,
         proposer: Vec<u8>,
     ) -> Result<(), StatusCodeEnum> {
-        if self.next_step(global_status).await == ChainStep::SyncStep {
+        if self.need_sync(global_status).await {
             Err(StatusCodeEnum::NodeInSyncMode)
         } else if self.own_proposal.read().await.is_some() {
             // already have own proposal
@@ -1758,15 +1747,15 @@ impl Chain {
         rd.get_system_config()
     }
 
-    pub async fn next_step(&self, global_status: &ChainStatus) -> ChainStep {
+    pub async fn need_sync(&self, global_status: &ChainStatus) -> bool {
         if global_status.height > *self.block_number.read().await
             && self.candidates.read().await.is_empty()
         {
             debug!("sync mode");
-            ChainStep::SyncStep
+            true
         } else {
             debug!("online mode");
-            ChainStep::OnlineStep
+            false
         }
     }
 

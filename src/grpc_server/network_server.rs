@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
+use statig::awaitable::InitializedStateMachine;
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use cita_cloud_proto::{
@@ -23,11 +27,13 @@ use crate::state_machine::ControllerStateMachine;
 
 // grpc server of network msg handler
 pub struct NetworkMsgHandlerServer {
-    controller: ControllerStateMachine,
+    controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
 }
 
 impl NetworkMsgHandlerServer {
-    pub(crate) fn new(controller: ControllerStateMachine) -> Self {
+    pub(crate) fn new(
+        controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
+    ) -> Self {
         NetworkMsgHandlerServer { controller }
     }
 }
@@ -48,20 +54,25 @@ impl NetworkMsgHandlerService for NetworkMsgHandlerServer {
         } else {
             let msg_type = msg.r#type.clone();
             let msg_origin = msg.origin;
-            self.controller.process_network_msg(msg).await.map_or_else(
-                |e| {
-                    if e != StatusCodeEnum::HistoryDupTx || rand::random::<u16>() < 8 {
-                        warn!(
-                            "rpc process network msg failed: {}. from: {:x}, type: {}",
-                            e.to_string(),
-                            msg_origin,
-                            msg_type
-                        );
-                    }
-                    Ok(Response::new(e.into()))
-                },
-                |_| Ok(Response::new(StatusCodeEnum::Success.into())),
-            )
+            self.controller
+                .read()
+                .await
+                .process_network_msg(msg)
+                .await
+                .map_or_else(
+                    |e| {
+                        if e != StatusCodeEnum::HistoryDupTx || rand::random::<u16>() < 8 {
+                            warn!(
+                                "rpc process network msg failed: {}. from: {:x}, type: {}",
+                                e.to_string(),
+                                msg_origin,
+                                msg_type
+                            );
+                        }
+                        Ok(Response::new(e.into()))
+                    },
+                    |_| Ok(Response::new(StatusCodeEnum::Success.into())),
+                )
         }
     }
 }

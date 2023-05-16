@@ -217,6 +217,8 @@ fn test_node_address_display() {
 pub struct NodeManager {
     pub nodes: Arc<RwLock<HashMap<NodeAddress, ChainStatus>>>,
 
+    pub nodes_pre_status: Arc<RwLock<HashMap<NodeAddress, ChainStatus>>>,
+
     pub misbehavior_nodes: Arc<RwLock<HashMap<NodeAddress, MisbehaviorStatus>>>,
 
     pub ban_nodes: Arc<RwLock<HashSet<NodeAddress>>>,

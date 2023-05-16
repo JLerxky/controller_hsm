@@ -13,7 +13,12 @@
 // limitations under the License.
 
 use cloud_util::unix_now;
-use std::sync::atomic::{AtomicU64, Ordering};
+use statig::awaitable::InitializedStateMachine;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use cita_cloud_proto::health_check::{
@@ -25,14 +30,17 @@ use crate::state_machine::ControllerStateMachine;
 
 // grpc server of Health Check
 pub struct HealthCheckServer {
-    controller: ControllerStateMachine,
+    controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
     timestamp: AtomicU64,
     height: AtomicU64,
     timeout: u64,
 }
 
 impl HealthCheckServer {
-    pub fn new(controller: ControllerStateMachine, timeout: u64) -> Self {
+    pub fn new(
+        controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
+        timeout: u64,
+    ) -> Self {
         HealthCheckServer {
             controller,
             timestamp: AtomicU64::new(unix_now()),
@@ -49,7 +57,13 @@ impl Health for HealthCheckServer {
         _request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
         info!("healthcheck entry!");
-        let height = self.controller.rpc_get_block_number(true).await.unwrap();
+        let height = self
+            .controller
+            .read()
+            .await
+            .rpc_get_block_number(true)
+            .await
+            .unwrap();
         let timestamp = unix_now();
         let old_height = self.height.load(Ordering::Relaxed);
         let old_timestamp = self.timestamp.load(Ordering::Relaxed);

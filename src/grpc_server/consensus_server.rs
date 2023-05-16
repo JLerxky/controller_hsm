@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
+use statig::awaitable::InitializedStateMachine;
+use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 use cita_cloud_proto::{
@@ -27,11 +31,13 @@ use crate::state_machine::ControllerStateMachine;
 
 //grpc server for Consensus2ControllerService
 pub struct Consensus2ControllerServer {
-    controller: ControllerStateMachine,
+    controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
 }
 
 impl Consensus2ControllerServer {
-    pub(crate) fn new(controller: ControllerStateMachine) -> Self {
+    pub(crate) fn new(
+        controller: Arc<RwLock<InitializedStateMachine<ControllerStateMachine>>>,
+    ) -> Self {
         Consensus2ControllerServer { controller }
     }
 }
@@ -46,22 +52,27 @@ impl Consensus2ControllerService for Consensus2ControllerServer {
         cloud_util::tracer::set_parent(&request);
         debug!("get_proposal request: {:?}", request);
 
-        self.controller.chain_get_proposal().await.map_or_else(
-            |e| {
-                warn!("rpc get proposal failed: {}", e.to_string());
-                Ok(Response::new(ProposalResponse {
-                    status: Some(e.into()),
-                    proposal: None,
-                }))
-            },
-            |(height, data)| {
-                let proposal = Proposal { height, data };
-                Ok(Response::new(ProposalResponse {
-                    status: Some(StatusCodeEnum::Success.into()),
-                    proposal: Some(proposal),
-                }))
-            },
-        )
+        self.controller
+            .read()
+            .await
+            .chain_get_proposal()
+            .await
+            .map_or_else(
+                |e| {
+                    warn!("rpc get proposal failed: {}", e.to_string());
+                    Ok(Response::new(ProposalResponse {
+                        status: Some(e.into()),
+                        proposal: None,
+                    }))
+                },
+                |(height, data)| {
+                    let proposal = Proposal { height, data };
+                    Ok(Response::new(ProposalResponse {
+                        status: Some(StatusCodeEnum::Success.into()),
+                        proposal: Some(proposal),
+                    }))
+                },
+            )
     }
 
     #[instrument(skip_all)]
@@ -77,7 +88,13 @@ impl Consensus2ControllerService for Consensus2ControllerServer {
         let height = proposal.height;
         let data = proposal.data;
 
-        match self.controller.chain_check_proposal(height, &data).await {
+        match self
+            .controller
+            .read()
+            .await
+            .chain_check_proposal(height, &data)
+            .await
+        {
             Err(e) => {
                 warn!("rpc check proposal({}) failed: {}", height, e.to_string());
                 Ok(Response::new(e.into()))
@@ -100,13 +117,19 @@ impl Consensus2ControllerService for Consensus2ControllerServer {
         let data = proposal.data;
         let proof = proposal_with_proof.proof;
 
-        let config = {
-            let rd = self.controller.auth.read().await;
-            rd.get_system_config()
-        };
+        let config = self
+            .controller
+            .read()
+            .await
+            .auth
+            .read()
+            .await
+            .get_system_config();
 
         if height != u64::MAX {
             self.controller
+                .read()
+                .await
                 .chain_commit_block(height, &data, &proof)
                 .await
                 .map_or_else(
@@ -132,7 +155,7 @@ impl Consensus2ControllerService for Consensus2ControllerServer {
                 )
         } else {
             let con_cfg = ConsensusConfiguration {
-                height: self.controller.get_status().await.height,
+                height: self.controller.read().await.get_status().await.height,
                 block_interval: config.block_interval,
                 validators: config.validators,
             };
