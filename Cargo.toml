@@ -22,11 +22,15 @@ tracing = "0.1"
 statig = { version = "0.3", features = ["async"] }
 futures = "0.3"
 
-cloud-util = { package = "cloud-util", git = "https://github.com/cita-cloud/cloud-common-rs" }
-cita_cloud_proto = { package = "cita_cloud_proto", git = "https://github.com/cita-cloud/cloud-common-rs" }
-
 crypto_sm = { git = "https://github.com/cita-cloud/crypto_sm", package = "crypto", optional = true }
 crypto_eth = { git = "https://github.com/cita-cloud/crypto_eth", package = "crypto", optional = true }
+
+cloud-util = { path = "../cloud-common-rs/cloud-util" }
+cita_cloud_proto = { path = "../cloud-common-rs/cloud-proto" }
+
+[patch."https://github.com/cita-cloud/cloud-common-rs"]
+cloud-util = { path = "../cloud-common-rs/cloud-util" }
+cita_cloud_proto = { path = "../cloud-common-rs/cloud-proto" }
 
 [build-dependencies]
 tonic-build = "0.9"

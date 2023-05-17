@@ -260,11 +260,11 @@ impl ControllerStateMachine {
     }
 
     fn on_transition(&mut self, source: &State, target: &State) {
-        println!("transitioned from `{source:?}` to `{target:?}`");
+        info!("transitioned from `{source:?}` to `{target:?}`");
     }
 
     fn on_dispatch(&mut self, state: StateOrSuperstate<Self>, event: &Event) {
-        println!("dispatching `{event:?}` to `{state:?}`");
+        info!("dispatching `{event:?}` to `{state:?}`");
     }
 }
 

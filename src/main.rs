@@ -368,10 +368,12 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
             .await,
     ));
 
-    let controller_for_reconnect = controller.clone();
+    let controller_for_reconnect = controller_state_machine.clone();
     tokio::spawn(async move {
         let mut long_interval = time::interval(Duration::from_secs(
             controller_for_reconnect
+                .read()
+                .await
                 .config
                 .origin_node_reconnect_interval,
         ));
@@ -379,11 +381,15 @@ async fn run(opts: RunOpts) -> Result<(), StatusCodeEnum> {
             long_interval.tick().await;
             {
                 controller_for_reconnect
+                    .read()
+                    .await
                     .task_sender
                     .send(Event::BroadCastCSI)
                     .await
                     .unwrap();
                 controller_for_reconnect
+                    .read()
+                    .await
                     .task_sender
                     .send(Event::RecordAllNode)
                     .await
