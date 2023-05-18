@@ -1235,68 +1235,7 @@ impl Chain {
             return;
         }
 
-        let mut current_height = self.get_status().await.height;
-        let controller_clone = self.clone();
-        tokio::spawn(async move {
-            for _ in 0..controller_clone.config.sync_req {
-                let (global_address, global_status) = controller_clone.get_global_status().await;
-
-                if controller_clone.need_sync(&global_status).await {
-                    if let Some(sync_req) = controller_clone
-                        .sync_manager
-                        .get_sync_block_req(current_height, &global_status)
-                        .await
-                    {
-                        controller_clone.set_sync_state(true).await;
-                        current_height = sync_req.end_height;
-                        controller_clone
-                            .unicast_sync_block(global_address.0, sync_req.clone())
-                            .await
-                            .await
-                            .unwrap();
-                        if sync_req.start_height == sync_req.end_height {
-                            return;
-                        }
-                    } else {
-                        return;
-                    }
-                } else {
-                    controller_clone.set_sync_state(false).await;
-                    return;
-                }
-            }
-        });
-    }
-
-    pub async fn sync_block(&self) -> Result<(), StatusCodeEnum> {
-        let mut current_height = self.get_status().await.height;
-        for _ in 0..self.config.sync_req {
-            let (global_address, global_status) = self.get_global_status().await;
-
-            if self.need_sync(&global_status).await {
-                if let Some(sync_req) = self
-                    .sync_manager
-                    .get_sync_block_req(current_height, &global_status)
-                    .await
-                {
-                    self.set_sync_state(true).await;
-                    current_height = sync_req.end_height;
-                    self.unicast_sync_block(global_address.0, sync_req.clone())
-                        .await
-                        .await
-                        .unwrap();
-                    if sync_req.start_height == sync_req.end_height {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                self.set_sync_state(false).await;
-                break;
-            }
-        }
-        Ok(())
+        self.task_sender.send(Event::TrySyncBlock).await.unwrap();
     }
 
     pub async fn make_csi(

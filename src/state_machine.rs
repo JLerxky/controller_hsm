@@ -30,6 +30,8 @@ pub enum Event {
     SyncBlockReq(SyncBlockRequest, u64),
     // multicast sync block request
     SyncBlock,
+    // try to sync block
+    TrySyncBlock,
     // broadcast chain status init
     BroadCastCSI,
     // record all node chain status
@@ -47,6 +49,9 @@ impl ControllerStateMachine {
     #[superstate]
     async fn online(&self, event: &Event) -> Response<State> {
         match event {
+            Event::TrySyncBlock => {
+                return self.sync_block().await;
+            }
             Event::SyncBlockReq(req, origin) => {
                 let mut block_vec = Vec::new();
 
@@ -146,7 +151,7 @@ impl ControllerStateMachine {
                         }
                     }
                     if syncing {
-                        self.sync_block().await.unwrap();
+                        return self.sync_block().await;
                     }
                     return Transition(State::sync());
                 } else {
@@ -257,6 +262,38 @@ impl ControllerStateMachine {
 impl ControllerStateMachine {
     pub fn new(chain: Chain) -> Self {
         ControllerStateMachine(chain)
+    }
+
+    pub async fn sync_block(&self) -> Response<State> {
+        let mut current_height = self.get_status().await.height;
+        let mut state = Super;
+        for _ in 0..self.config.sync_req {
+            let (global_address, global_status) = self.get_global_status().await;
+
+            if self.need_sync(&global_status).await {
+                if let Some(sync_req) = self
+                    .sync_manager
+                    .get_sync_block_req(current_height, &global_status)
+                    .await
+                {
+                    state = Transition(State::sync());
+                    current_height = sync_req.end_height;
+                    self.unicast_sync_block(global_address.0, sync_req.clone())
+                        .await
+                        .await
+                        .unwrap();
+                    if sync_req.start_height == sync_req.end_height {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                state = Transition(State::participate_in_consensus());
+                break;
+            }
+        }
+        state
     }
 
     fn on_transition(&mut self, source: &State, target: &State) {
